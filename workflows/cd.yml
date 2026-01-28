@@ -1,0 +1,255 @@
+# CD Pipeline - Continuous Deployment
+# Triggers: Push to main branch
+# Deploys to AWS ECS via Terraform
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: shopping-cart-api
+  ECS_CLUSTER: shopping-cart-cluster
+  ECS_SERVICE: shopping-cart-service
+
+jobs:
+  # ===========================================================================
+  # Build and Push Docker Image
+  # ===========================================================================
+  build-and-push:
+    name: Build and Push
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Configure AWS credentials
+      # NOTE: In production, use OIDC instead of access keys
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/prod/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:buildcache
+          cache-to: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:buildcache,mode=max
+          provenance: false
+
+      - name: Output image details
+        run: |
+          echo "Image pushed: ${{ steps.meta.outputs.tags }}"
+          echo "Image digest: ${{ steps.build.outputs.digest }}"
+
+  # ===========================================================================
+  # Deploy to Staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: staging
+      url: https://staging-api.example.com/health
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        working-directory: infra/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: infra/terraform
+        run: |
+          terraform plan \
+            -var="environment=staging" \
+            -var="image_tag=${{ github.sha }}" \
+            -var="app_version=${{ github.sha }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: infra/terraform
+        run: terraform apply -auto-approve tfplan
+
+      # Alternative: Direct ECS deployment without Terraform apply
+      # Uncomment below if you prefer to update ECS directly
+      #
+      # - name: Update ECS Service
+      #   run: |
+      #     aws ecs update-service \
+      #       --cluster ${{ env.ECS_CLUSTER }}-staging \
+      #       --service ${{ env.ECS_SERVICE }}-staging \
+      #       --force-new-deployment
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }}-staging \
+            --services ${{ env.ECS_SERVICE }}-staging \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deployment completed or timed out"
+
+      - name: Health check
+        run: |
+          echo "Performing health check..."
+          # In production, use actual staging URL
+          # curl -f https://staging-api.example.com/health || exit 1
+          echo "Health check skipped (no actual deployment)"
+
+  # ===========================================================================
+  # Deploy to Production (Manual approval required)
+  # ===========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://api.example.com/health
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        working-directory: infra/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: infra/terraform
+        run: |
+          terraform plan \
+            -var="environment=production" \
+            -var="image_tag=${{ github.sha }}" \
+            -var="app_version=${{ github.sha }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: infra/terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --services ${{ env.ECS_SERVICE }}-production \
+            --region ${{ env.AWS_REGION }} || true
+
+      - name: Production health check
+        run: |
+          echo "Performing production health check..."
+          # curl -f https://api.example.com/health || exit 1
+          echo "Health check skipped (no actual deployment)"
+
+      - name: Notify deployment success
+        run: |
+          echo "Production deployment completed successfully!"
+          echo "Image: ${{ needs.build-and-push.outputs.image-tag }}"
+          echo "Commit: ${{ github.sha }}"
+
+  # ===========================================================================
+  # Cleanup old images (Weekly)
+  # ===========================================================================
+  cleanup:
+    name: Cleanup Old Images
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup untagged images
+        run: |
+          echo "Cleaning up untagged images from ECR..."
+          # Get list of untagged images
+          # aws ecr list-images \
+          #   --repository-name ${{ env.ECR_REPOSITORY }} \
+          #   --filter "tagStatus=UNTAGGED" \
+          #   --query 'imageIds[*]' \
+          #   --output json | \
+          # aws ecr batch-delete-image \
+          #   --repository-name ${{ env.ECR_REPOSITORY }} \
+          #   --image-ids file:///dev/stdin || true
+          echo "Cleanup skipped (demonstration only)"

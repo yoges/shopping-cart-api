@@ -1,0 +1,53 @@
+# Docker Compose for Local Development
+# NOTE: This is for local development testing ONLY
+# Deployment uses Terraform-provisioned infrastructure
+
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ../
+      dockerfile: infra/docker/dev/Dockerfile
+    container_name: shopping-cart-api-dev
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+    volumes:
+      # Mount source code for hot reloading
+      - ../src:/app/src:ro
+      - ../package.json:/app/package.json:ro
+      - ../tsconfig.json:/app/tsconfig.json:ro
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Production image testing
+  app-prod:
+    build:
+      context: ../
+      dockerfile: infra/docker/prod/Dockerfile
+    container_name: shopping-cart-api-prod-test
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    ports:
+      - "3001:3000"
+    profiles:
+      - prod
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: shopping-cart-network

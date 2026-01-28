@@ -1,0 +1,46 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Test and coverage
+coverage
+*.spec.ts
+
+# Documentation
+docs
+*.md
+!README.md
+
+# Terraform
+infra/terraform
+*.tfstate
+*.tfstate.*
+.terraform
+
+# Docker
+.docker
+docker-compose*.yml
+
+# Environment
+.env
+.env.*
+
+# Logs
+logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
